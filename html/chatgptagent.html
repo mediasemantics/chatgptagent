@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html>
+<head>
+</head>
+<body style="overflow:hidden">
+
+<script src="charapiclient.js"></script>
+
+<div id="agentDiv" style="width:250px; height:200px;"></div>
+<p>
+<input id="input1" type="text" autofocus onkeypress="keypress()"><button onclick="submit()">Submit</button>
+<p>
+<div id="historyDiv">
+</div>
+
+<script>
+// Initialize your character in a div
+var character;
+document.addEventListener("DOMContentLoaded", function() {
+    character = CharApiClient.setupDiv("agentDiv", {
+        width: 250,
+        height: 200,
+        // TODO: Replace this with your own endpoint on your own server. 
+        endpoint: "http://localhost:3000/animate",
+        // Character API parameters. TODO: If your api works without authentication, e.g. if your page is accessible without a login, then it is wise 
+        // to *fix* or *limit* as many parameters as you can in your server code, including a background with a logo, if you can, 
+        // in order to minimize the attractiveness of your endpoint for scammers. (CORS helps with this, but it can still be defeated.)
+        character: "SusanHead",
+        // Character version - get this from the character catalog
+        version: "3.0.1",
+        // Character idle pattern - get this from the character catalog
+        idleData: {"blink":["blink"],"normal":["blink","headidle1-3"]},
+        // Increment the 'cache' value if you make changes to the parameters you fix in your server.
+        // Even if you delete your server-side cache, your clients may have images in their client cache. Incrementing the
+        // cache number in the client is a simple way to ensure that neither client or server-cached images are accidentally used.
+        cache: 1
+    });
+})
+
+// Create a userid using the current time and some random numbers
+var userid = (new Date()).getTime().toString();
+for (var i = 0; i <= 3; i++)
+    userid += Math.floor(Math.random()*10);
+
+function submit() {
+    var input = document.getElementById('input1').value;
+    document.getElementById('input1').value = "";
+    var div = document.getElementById('historyDiv')
+    div.innerHTML += "> " + input + "<br>";
+    reply(input);
+}
+
+function keypress(e) {
+    if (event.keyCode == 13)
+        submit();
+}
+
+function reply(input) {
+    var xhr = new XMLHttpRequest();
+    xhr.open('GET', "http://localhost:3000/chat?userid=" + userid + "&input=" + encodeURIComponent(input), true);
+    xhr.onload = function () {
+        var ret = JSON.parse(xhr.response);
+        var div = document.getElementById('historyDiv');
+        if (ret.output) {
+            var sentences = sentenceSplit(ret.output);
+            for (var i = 0; i < sentences.length; i++) {
+                character.dynamicPlay({say:sentences[i]});
+                // results in closedCaption event when the audio starts, triggering the reveal in the history
+            }
+        }
+    };
+    xhr.send();
+}
+
+function sentenceSplit(s) {
+    var a = (s + " ").replace(/([\.!\?]+[ ]+)/g, "$1\n").split("\n"); // add space, then add a \n after ". ", "?!  ", for example
+    // then split on \n - this trick lets us keep that punctuation
+    // finish by trimming each piece and remove the empty ones
+    var b = [];
+    for (var i = 0; i < a.length; i++) {
+        var t = a[i].trim();
+        if (t.length > 0) b.push(t);
+    }
+    return b;
+}
+
+document.getElementById("agentDiv").addEventListener("closedCaption", function(e) {document.getElementById('historyDiv').innerHTML += e.detail + "<br>"});
+
+</script>
+
+</body>
+</html>
