@@ -7,7 +7,7 @@ This project uses OpenAI's completions API, along with the [Character API](https
 You can see the Reference Implementation running [here](https://mediasemantics.com/chatgptagent.html). 
 
 ## Requirements
-This ReadMe describes how to install the project on your local machine. It works on Mac and Windows, but you must have NodeJS installed.
+This ReadMe describes how to install the project on your local machine. You must have NodeJS installed.
 If you prefer, you can also install the server portion directly on a web server.
 
 ## Obtaining keys
@@ -26,7 +26,7 @@ Next, click on the newly created user to open it, and click the "Security creden
 You will want to copy two strings. The Access key ID is a string of capitalized alphanumeric characters, and the Secret Access Key is longer string
 of mixed-case characters. Make sure you record both values, as you will need to insert them into the sample.
 
-## Installation
+## Installing the Server
 Install the sample in a directory on the server, e.g. the home directory:
 ```
 cd ~  
@@ -60,18 +60,24 @@ node server.js
 ```
 You should see "Listening on port 3000".
 
-Next, you can move the file html/chatgptagent.html to your web directory and run it in a web browser using the appropriate http://localhost url. 
+## Installing the Client
 
-Or you can use the following steps to run the file in a local web server:
+Open a second command window in the html directory. Ensure the client module is installed.
 
-In a new command line window:
+```
+cd ~/chatgptagent/html
+npm install
+```
+
+Then install and run a local file server.
+
 ```
 npm install -g http-server
 cd ~/chatgptagent/html
 http-server . -p 3001
 ```
-Then point your browser to: http://localhost:3001/chatgptagent.html
 
+Then point your browser to: http://localhost:3001/chatgptagent.html
 
 ## How it works
 
