@@ -1,48 +1,77 @@
-var express = require('express');
-var bodyParser = require('body-parser');
-var fs = require('fs');
-var request = require('request');
-var AWS = require('aws-sdk');
-var zlib = require('zlib');
-var lockFile = require('lockfile');
+let express = require('express');
+let http = require('http');
+let bodyParser = require('body-parser');
+let fs = require('fs');
+const { PollyClient, SynthesizeSpeechCommand } = require('@aws-sdk/client-polly');
+let zlib = require('zlib');
+let lockFile = require('lockfile');
 
-// TODO set up your Character API key here
-var charAPIKey = "xxxxxxxxxxxxxxxxxxxxxxxxx";
+let charAPIKey = process.env.CHARACTER_API_KEY;
 
-var polly = new AWS.Polly({
-  region: 'us-east-1',
-  maxRetries: 3,
-  accessKeyId: 'xxxxxxxxxxxxxxxxxxxx',
-  secretAccessKey: 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx',
-  timeout: 15000
+let polly = new PollyClient({
+  region: process.env.POLLY_REGION,
+  maxAttempts: 3,
+  credentials: {
+    accessKeyId: process.env.POLLY_ACCESS_KEY_ID,
+    secretAccessKey: process.env.POLLY_SECRET_ACCESS_KEY,
+  },
+  requestHandler: { requestTimeout: 15000 },
 });
 
-// TODO set up your OpenAI key here
-var openAIKey = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
+let openAIKey = process.env.OPENAI_API_KEY;
 
-// TODO set the path to your cache directory, and make sure to give it read/write permission, e.g. mkdir cache && sudo chgrp apache cache && sudo chmod g+w cache
-var cachePrefix = "./cache/";
+// Path to your cache directory - you may need to give it read/write permission, e.g.
+// apache on EC2 linux would be: sudo chgrp apache cache && sudo chmod g+w cache
+let cachePrefix = "./cache/";
 
 // Set up express
-var app = express();
+let app = express();
+let server = http.createServer(app);
 app.use(bodyParser.json({limit: '1mb'}));
 app.use(bodyParser.urlencoded({ limit: '1mb', extended: true }));
 
 // The Character API endpoints
 
-var urlAnimate = "http://api.mediasemantics.com/animate";
-var urlCatalog = "http://api.mediasemantics.com/catalog";
+let urlAnimate = "http://api.mediasemantics.com/animate";
+let urlCatalog = "http://api.mediasemantics.com/catalog";
 
-var history = {};
+function requestGet(url, qs, callback) {
+    if (qs) {
+        let params = new URLSearchParams();
+        for (let k in qs)
+            if (qs[k] != null) params.append(k, String(qs[k]));
+        url = url + '?' + params.toString();
+    }
+    fetch(url)
+        .then(function(res) {
+            return res.arrayBuffer().then(function(buf) {
+                let headers = {};
+                res.headers.forEach(function(v, k) { headers[k] = v; });
+                callback(null, { statusCode: res.status, headers: headers }, Buffer.from(buf));
+            });
+        })
+        .catch(function(err) { callback(err, null, null); });
+}
+
+function requestPost(url, body, headers, callback) {
+    fetch(url, { method: 'POST', body: body, headers: headers })
+        .then(function(res) {
+            return res.text().then(function(text) {
+                callback(null, { statusCode: res.status, headers: {} }, text);
+            });
+        })
+        .catch(function(err) { callback(err, null, null); });
+}
+let history = {};
 
 app.get('/chat', function(req, res, next) {
     console.log("chat " + req.query.userid + " " + req.query.input);
-    
+
     let messages = [];
-    messages.push({role:"system", "content":"You are Susan, a helpful female assistant."});  // This defines your bot's name, gender, and personality
+    messages.push({role:"system", "content":"You are Michelle, a helpful female assistant."});  // This defines your bot's name, gender, and personality
     // take last few of the history
     let historyThisUser = history[req.query.userid] || [];
-    for (let i = Math.max(0, historyThisUser.length - 3); i < historyThisUser.length; i++) { 
+    for (let i = Math.max(0, historyThisUser.length - 3); i < historyThisUser.length; i++) {
         if (historyThisUser[i].substr(0,1) == ">")
             messages.push({role:"user", content:historyThisUser[i].substr(2)});
         else
@@ -57,9 +86,9 @@ app.get('/chat', function(req, res, next) {
         user: req.query.userid
     };
     console.log("---> calling openai w/ " + req.query.userid + " " + JSON.stringify(messages));
-    var replyTimeStart = new Date();
-    request.post({url:"https://api.openai.com/v1/chat/completions", body:JSON.stringify(param), headers:{'Content-Type':'application/json', 'Authorization':'Bearer ' + openAIKey}}, function (err, httpResponse, body) {
-        var replyTimeEnd = new Date();
+    let replyTimeStart = new Date();
+    requestPost("https://api.openai.com/v1/chat/completions", JSON.stringify(param), {'Content-Type':'application/json', 'Authorization':'Bearer ' + openAIKey}, function (err, httpResponse, body) {
+        let replyTimeEnd = new Date();
         if (httpResponse.statusCode != 200) return finishChat({success: false, message:body}, req, res);
         body = JSON.parse(body);
         let output = body.choices[0].message.content.trim();
@@ -77,7 +106,7 @@ function finishChat(o, req, res) {
     if (!o.success) console.log(o.message);
     if (!o.success) res.status(200);
     if (req.get("Origin")) res.setHeader('Access-Control-Allow-Origin', req.get("Origin"));  // This line removes all CORS protection!
-    // TODO: IMPORTANT: Remove line above and uncomment lines below, filling in your domain, for CORS protection
+    // IMPORTANT: Remove line above and uncomment lines below, filling in your domain, for CORS protection
     //if ((req.get("Origin")||"").indexOf("localhost") != -1) res.setHeader('Access-Control-Allow-Origin', req.get("Origin")); // allow testing on localhost
     //else if ((req.get("Origin")||"").indexOf("yourdomain.com") != -1) res.setHeader('Access-Control-Allow-Origin', req.get("Origin"));
     res.setHeader('content-type', 'application/json');
@@ -89,24 +118,25 @@ app.get('/animate', function(req, res, next) {
     console.log("animate");
     if (req.query.type != "audio" && req.query.type != "image" && req.query.type != "model" && req.query.type != "data") req.query.type = "image"; // default to image
 
-    var character;
-    var version;
-    
+    let character;
+    let version;
+
     // The client specifies the character
     if (req.query.character) character = req.query.character;
     // And a precise version - this lets you upgrade to a new character and clear all levels of caching
     if (req.query.version) version = req.query.version;
-    
+
     // These parameters are normally supplied by the client
-    var width = parseInt(req.query.width || '250');
-    var height = parseInt(req.query.height || '200');
-    var density = req.query.density || "1";
-    var charscale = req.query.charscale || "1";
-    var format = req.query.format || "png";
-    var voice = req.query.voice || "NeuralJoanna";
-    
+    let width = parseInt(req.query.width || '250');
+    let height = parseInt(req.query.height || '200');
+    let density = req.query.density || "1";
+    let charscale = req.query.charscale || "1";
+    let format = req.query.format || "png";
+    let voice = req.query.voice || "NeuralJoanna";
+    let clothing = req.query.clothing || "";
+
     // Build a hash of all parameters to send to the Character API
-    var o = {
+    let o = {
         "character":character,
         "version":version,
         "return":"true",
@@ -119,10 +149,15 @@ app.get('/animate', function(req, res, next) {
         "charx":"0",
         "chary":"0",
         "fps":"24",
+        "clothing":clothing,
         "do":req.query.do,
         "say":req.query.say,
+        "streaming":req.query.streaming,
+        "final":req.query.final,
+        "continuation":req.query.continuation,
+        "level":req.query.level
     };
-    
+
     // Add to that any other parameters that are variable, from the client
     if (req.query.texture) o.texture = req.query.texture;
     if (req.query.with) o.with = req.query.with;
@@ -130,25 +165,51 @@ app.get('/animate', function(req, res, next) {
     if (req.query.chary) o.chary = req.query.chary.toString();
     if (req.query.lipsync) o.lipsync = req.query.lipsync;
     if (req.query.initialstate) o.initialstate = req.query.initialstate;
-    if (req.query.return) o.return = req.query.return;        
+    if (req.query.return) o.return = req.query.return;
 
     // TODO - if you DO allow parameters to come from the client, then it is a good idea to limit them to what you need. E.g.:
     // if (o.character != "SteveHead" && o.character != "SusanHead") throw new Error('limit reached');  // limit characters
     // if (o.say && o.say.length > 256) throw new Error('limit reached'); // limit message length
     // if (voice != "NeuralJoanna" && voice != "NeuralMatthew") throw new Error('limit reached'); // limit voices
 
-    if (o.do || o.say) o["with"] = "all";  // all but the initial empty action requests that output be generated that assumes we will fetch all textures
-    
+    if (o.do || o.say || o.streaming == 'true') o["with"] = "all";  // all but the initial empty action requests that output be generated that assumes we will fetch all textures
+
     // Now use all these parameters to create a hash that becomes the file type
-    var crypto = require('crypto');
-    var hash = crypto.createHash('md5');
-    for (var key in o)
+    let crypto = require('crypto');
+    let hash = crypto.createHash('md5');
+    for (let key in o)
         hash.update(o[key]||"");
     hash.update(voice);                                 // This is not a Character API parameter but it also should contribute to the hash
     if (req.query.cache) hash.update(req.query.cache);  // Client-provided cache buster that can be incremented when server code changes, to defeat browser caching
-    var filebase = hash.digest("hex");
-    var type = req.query.type;                          // This is the type of file actually requested - audio, image, model, or data
-    var format = o.format;                              // "png" or "jpeg"
+    let filebase = hash.digest("hex");
+    let type = req.query.type;                          // This is the type of file actually requested - audio, image, model, or data
+
+    // Special-case streaming calls, which do not get cached, have no audio, and no image
+    if (req.query.streaming == "true") {
+        o.key = charAPIKey;
+        o.zipdata = true;
+        console.log("---> calling animate w/ "+JSON.stringify(o));
+        let animateTimeStart = new Date();
+        requestGet(urlAnimate, o, function(err, httpResponse, body) {
+            let animateTimeEnd = new Date();
+            console.log("<--- back from animate - " + (animateTimeEnd.getTime() - animateTimeStart.getTime()));
+            if (err) return next(new Error(body));
+            if (httpResponse.statusCode >= 400) return next(new Error(body));
+            let buffer = Buffer.from(httpResponse.headers["x-msi-animationdata"], 'base64')
+            zlib.unzip(buffer, function (err, buffer) {
+                res.statusCode = "200";
+                if (req.get("Origin")) res.setHeader('Access-Control-Allow-Origin', req.get("Origin"));  // This line removes all CORS protection!
+                // TODO: IMPORTANT: Remove line above and uncomment lines below, filling in your domain, for CORS protection
+                //if ((req.get("Origin")||"").indexOf("localhost") != -1) res.setHeader('Access-Control-Allow-Origin', req.get("Origin")); // allow testing on localhost
+                //else if ((req.get("Origin")||"").indexOf("yourdomain.com") != -1) res.setHeader('Access-Control-Allow-Origin', req.get("Origin"));
+                res.setHeader('Vary', 'Origin');
+                res.setHeader('Cache-Control', 'no-store');
+                res.setHeader('content-type', 'application/json; charset=utf-8');
+                res.send(buffer);
+            });
+        });
+        return;
+    }
 
     // NOTE: A more scaleable implementation, optimized for load balancers, would use redis and ioredis-lock - see sample code interspersed.
     lockFile.lock(targetFile(filebase, "lock"), {}, function() {
@@ -158,7 +219,7 @@ app.get('/animate', function(req, res, next) {
                 lockFile.unlock(targetFile(filebase, "lock"), function() {
                     // "touch" each file we return - you can use a cron to delete files older than a certain age
                     let time = new Date();
-                    fs.utimes(file, time, time, () => { 
+                    fs.utimes(file, time, time, () => {
                         finishAnimate(req, res, filebase, type, o.format);
                     });
                 });
@@ -179,9 +240,9 @@ app.get('/animate', function(req, res, next) {
                     o.key = charAPIKey;
                     o.zipdata = true;
                     console.log("---> calling animate w/ "+JSON.stringify(o));
-                    var animateTimeStart = new Date();						
-                    request.get({url:urlAnimate, qs: o, encoding: null}, function(err, httpResponse, body) {
-                        var animateTimeEnd = new Date();						
+                    let animateTimeStart = new Date();
+                    requestGet(urlAnimate, o, function(err, httpResponse, body) {
+                        let animateTimeEnd = new Date();
                         console.log("<--- back from animate - " + (animateTimeEnd.getTime() - animateTimeStart.getTime()));
                         if (err) return next(new Error(body));
                         if (httpResponse.statusCode >= 400) return next(new Error(body));
@@ -193,7 +254,7 @@ app.get('/animate', function(req, res, next) {
                                 });
                             }
                             else {
-                                var buffer = Buffer.from(httpResponse.headers["x-msi-animationdata"], 'base64')
+                                let buffer = Buffer.from(httpResponse.headers["x-msi-animationdata"], 'base64')
                                 zlib.unzip(buffer, function (err, buffer) {
                                     fs.writeFile(targetFile(filebase, "data"), buffer.toString(), "binary", function(err) { // redis.set("sample-data-" + filebase, buffer.toString(), function(err) {
                                         lockFile.unlock(targetFile(filebase, "lock"), function() { // redisLock.release().catch(err => console.log("LOCK NOT RELEASED"));
@@ -208,8 +269,8 @@ app.get('/animate', function(req, res, next) {
                 // Case where we need to get tts and lipsync it first
                 else
                 {
-                    var textOnly = removeAllButSpeechTags(o.say);
-                    doParallelTTS(textOnly, voice, function(err, audioData, lipsyncData) {
+                    let textOnly = removeAllButSpeechTags(o.say);
+                    doPollyTTS(textOnly, voice, function(err, audioData, lipsyncData) {
                         if (err) return next(new Error(err.message));
                         fs.writeFile(targetFile(filebase, "audio"), audioData, function (err) {
                             if (err) return next(new Error(err.message));
@@ -218,14 +279,14 @@ app.get('/animate', function(req, res, next) {
                             o.zipdata = true;
                             o.lipsync = lipsyncData;
                             o.say = removeSpeechTags(o.say);
-                            console.log("---> calling animate w/ "+JSON.stringify(o));						
-                            var animateTimeStart = new Date();						
-                            request.get({url:urlAnimate, qs: o, encoding: null}, function(err, httpResponse, body) {
+                            console.log("---> calling animate w/ "+JSON.stringify(o));
+                            let animateTimeStart = new Date();
+                            requestGet(urlAnimate, o, function(err, httpResponse, body) {
                                 if (err) return next(new Error(body));
-                                var animateTimeEnd = new Date();
+                                let animateTimeEnd = new Date();
                                 console.log("<--- back from animate - " + (animateTimeEnd.getTime() - animateTimeStart.getTime()));
                                 if (httpResponse.statusCode >= 400) return next(new Error(body));
-                                var buffer = Buffer.from(httpResponse.headers["x-msi-animationdata"], 'base64')
+                                let buffer = Buffer.from(httpResponse.headers["x-msi-animationdata"], 'base64')
                                 zlib.unzip(buffer, function (err, buffer) {
                                     if (err) return next(new Error(err.message));
                                         fs.writeFile(targetFile(filebase, "image", o.format), body, "binary", function(err) {
@@ -255,21 +316,13 @@ function containsActualSpeech(say) {
     return hasNonWhitespace;
 }
 
-function doParallelTTS(textOnly, voice, callback) {
-    var audioData;
-    var lipsyncData;
-    var firstErr = null;
-    var audioDone = false;
-    var phonemesDone = false;
-    
-    // Do both TTS request in parallel to save time
-    
-    var neural = false;
+async function doPollyTTS(textOnly, voice, callback) {
+    let neural = false;
     if (voice.substr(0,6) == "Neural") { // NeuralJoanna or Joanna
         neural = true;
         voice = voice.substr(6);
     }
-    var pollyData = {
+    let pollyData = {
         OutputFormat: 'mp3',
         Text: msToSSML(textOnly),
         VoiceId: voice,
@@ -277,42 +330,35 @@ function doParallelTTS(textOnly, voice, callback) {
         TextType: "ssml"
     };
     console.log("---> calling tts w/ " + JSON.stringify(pollyData));
-    var ttsTimeStart = new Date();
-    
-    polly.synthesizeSpeech(pollyData, function (err, data) {
-        if (err)
-            firstErr = err;
-        else 
-            audioData = data.AudioStream;
-        audioDone = true;
-        if (audioDone && phonemesDone) {
-            var ttsTimeEnd = new Date();
-            console.log("<--- back from tts - " + (ttsTimeEnd.getTime() - ttsTimeStart.getTime()));
-            callback(firstErr, audioData, lipsyncData);
-        }
-    });
-        
-    var pollyData2 = JSON.parse(JSON.stringify(pollyData));
+    let ttsTimeStart = new Date();
+
+    let pollyData2 = JSON.parse(JSON.stringify(pollyData));
     pollyData2.OutputFormat = 'json';
     pollyData2.SpeechMarkTypes = ['viseme'];
-    
-    polly.synthesizeSpeech(pollyData2, function (err, data) {
-        if (err)
-            firstErr = err;
-        else {
-            var zip = new require('node-zip')();
-            zip.file('lipsync', data.AudioStream);
-            lipsyncData = zip.generate({base64: true, compression: 'DEFLATE'});
-        }
-        phonemesDone = true;
-        if (audioDone && phonemesDone) {
-            var ttsTimeEnd = new Date();
-            console.log("<--- back from tts - " + (ttsTimeEnd.getTime() - ttsTimeStart.getTime()));
-            callback(firstErr, audioData, lipsyncData);
-        }
-    });
+
+    // Do both TTS requests in parallel to save time
+    try {
+        let [audioResult, phonemeResult] = await Promise.all([
+            polly.send(new SynthesizeSpeechCommand(pollyData)),
+            polly.send(new SynthesizeSpeechCommand(pollyData2))
+        ]);
+
+        let ttsTimeEnd = new Date();
+        console.log("<--- back from tts - " + (ttsTimeEnd.getTime() - ttsTimeStart.getTime()));
+
+        let audioData = Buffer.from(await audioResult.AudioStream.transformToByteArray());
+        let phonemeBuffer = Buffer.from(await phonemeResult.AudioStream.transformToByteArray());
+
+        let zip = new require('node-zip')();
+        zip.file('lipsync', phonemeBuffer);
+        let lipsyncData = zip.generate({base64: true, compression: 'DEFLATE'});
+
+        callback(null, audioData, lipsyncData);
+    } catch (err) {
+        callback(err, null, null);
+    }
 }
-    
+
 function targetFile(filebase, type, format) {
     if (type == "audio") return cachePrefix + filebase + ".mp3";
     else if (type == "image") return cachePrefix + filebase + "." + format;
@@ -329,43 +375,46 @@ function targetMime(type, format) {
 }
 
 function finishAnimate(req, res, filebase, type, format) {
-	var frstream = fs.createReadStream(targetFile(filebase, type, format));
-	res.statusCode = "200";
-    
+    let frstream = fs.createReadStream(targetFile(filebase, type, format));
+    res.statusCode = "200";
+
     if (req.get("Origin")) res.setHeader('Access-Control-Allow-Origin', req.get("Origin"));  // This line removes all CORS protection!
     // TODO: IMPORTANT: Remove line above and uncomment lines below, filling in your domain, for CORS protection
     //if ((req.get("Origin")||"").indexOf("localhost") != -1) res.setHeader('Access-Control-Allow-Origin', req.get("Origin")); // allow testing on localhost
     //else if ((req.get("Origin")||"").indexOf("yourdomain.com") != -1) res.setHeader('Access-Control-Allow-Origin', req.get("Origin"));
     res.setHeader('Vary', 'Origin');
-	res.setHeader('Cache-Control', 'max-age=31536000, public'); // 1 year (long!)
-	res.setHeader('content-type', targetMime(type, format));
-	frstream.pipe(res);        
+    if (req.query.streaming == "true") // streaming requests should never be cached
+        res.setHeader('Cache-Control', 'no-store');
+    else
+        res.setHeader('Cache-Control', 'max-age=31536000, public'); // 1 year (long!)
+    res.setHeader('content-type', targetMime(type, format));
+    frstream.pipe(res);
 }
 
-function msToSSML(s) { // e.g. "[silence] Look here." --> "<break time="1s"/> Look here."    
-    var ret = ssmlHelper(s, 1);
+function msToSSML(s) { // e.g. "[silence] Look here." --> "<break time="1s"/> Look here."
+    let ret = ssmlHelper(s, 1);
     // Any remaining tags can be eliminated for tts
     ret = ret.replace(/\[[^\]]*\]/g, "").replace("  "," "); // e.g. Look [cmd] here. --> Look here.
     return ret;
 }
 
-function removeSpeechTags(s) {  // e.g. "[silence] Look [blink] here." --> "Look [blink] here."    
+function removeSpeechTags(s) {  // e.g. "[silence] Look [blink] here." --> "Look [blink] here."
     let temp = ssmlHelper(s, 2);
     temp = temp.replace(/  /g, " ").trim();
     return temp;
 }
 
-function removeAllButSpeechTags(s) {  // e.g. "[silence] Look [blink] here." --> "[silence] Look here."    
+function removeAllButSpeechTags(s) {  // e.g. "[silence] Look [blink] here." --> "[silence] Look here."
     let temp = ssmlHelper(s, 3);
-    temp = temp.replace(new RegExp("\[[^\]]*\]", "g"), "").replace("  ", " ").trim(); // e.g. "Look [cmd] here." --> "Look here."    
+    temp = temp.replace(new RegExp("\[[^\]]*\]", "g"), "").replace("  ", " ").trim(); // e.g. "Look [cmd] here." --> "Look here."
     temp = temp.replace(/\{/g,'[');
     temp = temp.replace(/\}/g,']');
     return temp;
 }
 
 function ssmlHelper(s, c) {
-    //var old = s;
-    
+    //let old = s;
+
     // SSML is very strict about closing tags - we try to automatically close some tags
     if (c==1 && s.indexOf("[conversational]") != -1 && s.indexOf("[/conversational]") == -1) s += "[/conversational]";
     if (c==1 && s.indexOf("[news]") != -1 && s.indexOf("[/news]") == -1) s += "[/news]";
@@ -378,20 +427,20 @@ function ssmlHelper(s, c) {
     s = s.replace(/\[silence\]/g, c==1 ? '<break time="1s"/>' : (c==2 ? '': '[silence]'));      // [silence]
     s = s.replace(/\[silence ([0-9.]*)s\]/g, c==1 ? '<break time="$1s"/>' : (c==2 ? '': '[silence $1s]'));      // [silence 1.5s]
     s = s.replace(/\[silence ([0-9.]*)ms\]/g, c==1 ? '<break time="$1ms"/>' : (c==2 ? '': '[silence $1ms]'));      // [silence 300ms]
-    
+
     // Emphasis - note that these are not supported by polly except in non-neural, which we try to avoid, so eliminating from the speech tags for now.
-    
+
     // Language
     s = s.replace(/\[english\]/g, c==1 ? '<lang xml:lang="en-US">' : (c==2 ? '': '{english}'));      // [english]...[/english]
-    s = s.replace(/\[\/english\]/g, c==1 ? '</lang>' : (c==2 ? '': '{/english}'));                    
+    s = s.replace(/\[\/english\]/g, c==1 ? '</lang>' : (c==2 ? '': '{/english}'));
     s = s.replace(/\[french\]/g, c==1 ? '<lang xml:lang="fr-FR">' : (c==2 ? '': '{french}'));      // [french]...[/french]
-    s = s.replace(/\[\/french\]/g, c==1 ? '</lang>' : (c==2 ? '': '{/french}'));                    
+    s = s.replace(/\[\/french\]/g, c==1 ? '</lang>' : (c==2 ? '': '{/french}'));
     s = s.replace(/\[spanish\]/g, c==1 ? '<lang xml:lang="es">' : (c==2 ? '': '{spanish}'));      // [spanish]...[/spanish]
-    s = s.replace(/\[\/spanish\]/g, c==1 ? '</lang>' : (c==2 ? '': '{/spanish}'));                    
+    s = s.replace(/\[\/spanish\]/g, c==1 ? '</lang>' : (c==2 ? '': '{/spanish}'));
     s = s.replace(/\[italian\]/g, c==1 ? '<lang xml:lang="it">' : (c==2 ? '': '{italian}'));      // [italian]...[/italian]
-    s = s.replace(/\[\/italian\]/g, c==1 ? '</lang>' : (c==2 ? '': '{/italian}'));                    
+    s = s.replace(/\[\/italian\]/g, c==1 ? '</lang>' : (c==2 ? '': '{/italian}'));
     s = s.replace(/\[german\]/g, c==1 ? '<lang xml:lang="de">' : (c==2 ? '': '{german}'));      // [german]...[/german]
-    s = s.replace(/\[\/german\]/g, c==1 ? '</lang>' : (c==2 ? '': '{/german}'));                    
+    s = s.replace(/\[\/german\]/g, c==1 ? '</lang>' : (c==2 ? '': '{/german}'));
 
     // Say as
     s = s.replace(/\[spell\]/g, c==1 ? '<say-as interpret-as="characters">' : (c==2 ? '': '{spell}'));      // [spell]a[/spell]
@@ -409,7 +458,7 @@ function ssmlHelper(s, c) {
 
     s = s.replace(/\[ipa (.*?)\]/g, c==1 ? '<phoneme alphabet="ipa" ph="$1">' : (c==2 ? '': '{ipa $1}'));      // [ipa pɪˈkɑːn]pecan[/ipa]
     s = s.replace(/\[\/ipa\]/g, c==1 ? '</phoneme>' : (c==2 ? '': '{/ipa}'));
-    var m;
+    let m;
     while (m = s.match(/\[sampa (.*?)\]/)) {
         s = s.replace(m[0], c==1 ? '<phoneme alphabet="x-sampa" ph="' + m[1].replace(/"/g,"&quot;").replace(/</g,"&lt;").replace(/>/g,"&gt;") + '">' : (c==2 ? '': '{sampa $1}'));
     }
@@ -419,23 +468,23 @@ function ssmlHelper(s, c) {
 
     s = s.replace(/\[drc\]/g, c==1 ? '<amazon:effect name="drc">' : (c==2 ? '': '{drc}'));      // [drc]dynamic range correction[/drc]
     s = s.replace(/\[\/drc\]/g, c==1 ? '</amazon:effect>' : (c==2 ? '': '{/drc}'));
-    
+
     // Speaking style
     s = s.replace(/\[conversational\]/g, c==1 ? '<amazon:domain name="conversational">' : (c==2 ? '': '{conversational}'));      // [conversational]...[/conversational]
     s = s.replace(/\[\/conversational\]/g, c==1 ? '</amazon:domain>' : (c==2 ? '': '{/conversational}'));
     s = s.replace(/\[news\]/g, c==1 ? '<amazon:domain name="news">' : (c==2 ? '': '{news}'));      // [news]...[/news]
-    s = s.replace(/\[\/news\]/g, c==1 ? '</amazon:domain>' : (c==2 ? '': '{/news}')); 
-    
+    s = s.replace(/\[\/news\]/g, c==1 ? '</amazon:domain>' : (c==2 ? '': '{/news}'));
+
     // volume
     s = s.replace(/\[volume (.*?)\]/g, c==1 ? '<prosody volume="$1">' : (c==2 ? '': '{volume $1}'));      // [volume loud]...[/volume] [volume -6dB]...[/volume]
-    s = s.replace(/\[\/volume\]/g, c==1 ? '</prosody>' : (c==2 ? '': '{/volume}')); 
+    s = s.replace(/\[\/volume\]/g, c==1 ? '</prosody>' : (c==2 ? '': '{/volume}'));
     // rate
     s = s.replace(/\[rate (.*?)\]/g, c==1 ? '<prosody rate="$1">' : (c==2 ? '': '{rate $1}'));      // [rate slow]...[/rate] [rate 80%]...[/rate]
-    s = s.replace(/\[\/rate\]/g, c==1 ? '</prosody>' : (c==2 ? '': '{/rate}')); 
+    s = s.replace(/\[\/rate\]/g, c==1 ? '</prosody>' : (c==2 ? '': '{/rate}'));
     // pitch
     s = s.replace(/\[pitch (.*?)\]/g, c==1 ? '<prosody pitch="$1">' : (c==2 ? '': '{pitch $1}'));      // [pitch high]...[/pitch] [pitch +5%]...[/pitch]
-    s = s.replace(/\[\/pitch\]/g, c==1 ? '</prosody>' : (c==2 ? '': '{/pitch}')); 
-            
+    s = s.replace(/\[\/pitch\]/g, c==1 ? '</prosody>' : (c==2 ? '': '{/pitch}'));
+
     //if (use && s != old) console.log("SSML: " + old + " -> " + s);
     if (c==1) return "<speak>" + s + "</speak>";
     else return s;
@@ -445,10 +494,10 @@ function ssmlHelper(s, c) {
 app.get('/catalog', function(req, res, next) {
     let o = {key: charAPIKey};
     console.log("---> calling catalog");
-    var catalogTimeStart = new Date();						
-    request.get({url:urlCatalog, qs: o, encoding: null}, function(err, httpResponse, body) {
+    let catalogTimeStart = new Date();
+    requestGet(urlCatalog, o, function(err, httpResponse, body) {
         if (err) return next(new Error(body));
-        var catalogTimeEnd = new Date();
+        let catalogTimeEnd = new Date();
         console.log("<--- back from catalog - " + (catalogTimeEnd.getTime() - catalogTimeStart.getTime()));
         if (req.get("Origin")) res.setHeader('Access-Control-Allow-Origin', req.get("Origin"));
         res.setHeader('content-type', 'application/json');
@@ -457,6 +506,7 @@ app.get('/catalog', function(req, res, next) {
     });
 });
 
-app.listen(3000, function() {
+
+server.listen(3000, function() {
   console.log('Listening on port 3000');
 });

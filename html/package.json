@@ -1,7 +1,5 @@
 {
-  "name": "chatgptagent",
   "dependencies": {
     "@mediasemantics/character-api-client": "^1.0.0"
-  },
-  "devDependencies": {}
+  }
 }

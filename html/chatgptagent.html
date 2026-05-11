@@ -4,8 +4,6 @@
 </head>
 <body style="overflow:hidden">
 
-<script src="charapiclient.js"></script>
-
 <div id="agentDiv" style="width:250px; height:200px;"></div>
 <p>
 <input id="input1" type="text" autofocus><button id="button1">Submit</button>
@@ -17,29 +15,30 @@
 import CharacterApiClient from './node_modules/@mediasemantics/character-api-client/character-api-client.js';
 
 // Initialize your character in a div
-var character;
+let character;
 document.addEventListener("DOMContentLoaded", function() {
     character = new CharacterApiClient("agentDiv", {
         width: 250,
         height: 200,
-        character: "SusanHead",
+        character: "MichelleHead",
+        voice: "NeuralJoanna",
         animateEndpoint: "http://localhost:3000/animate",
-        catalogEndpoint: "http://localhost:3000/catalog",
+        catalogEndpoint: "http://localhost:3000/catalog"
     });
     
     document.getElementById("input1").addEventListener("keypress", keypress);
     document.getElementById("button1").addEventListener("click", submit);
-})
+});
 
 // Create a userid using the current time and some random numbers
-var userid = (new Date()).getTime().toString();
-for (var i = 0; i <= 3; i++)
+let userid = (new Date()).getTime().toString();
+for (let i = 0; i <= 3; i++)
     userid += Math.floor(Math.random()*10);
 
 function submit() {
-    var input = document.getElementById('input1').value;
+    let input = document.getElementById('input1').value;
     document.getElementById('input1').value = "";
-    var div = document.getElementById('historyDiv')
+    let div = document.getElementById('historyDiv')
     div.innerHTML += "> " + input + "<br>";
     reply(input);
 }
@@ -50,32 +49,17 @@ function keypress(e) {
 }
 
 function reply(input) {
-    var xhr = new XMLHttpRequest();
-    xhr.open('GET', "http://localhost:3000/chat?userid=" + userid + "&input=" + encodeURIComponent(input), true);
-    xhr.onload = function () {
-        var ret = JSON.parse(xhr.response);
-        var div = document.getElementById('historyDiv');
-        if (ret.output) {
-            var sentences = sentenceSplit(ret.output);
-            for (var i = 0; i < sentences.length; i++) {
-                character.dynamicPlay({say:sentences[i]});
-                // results in closedCaption event when the audio starts, triggering the reveal in the history
+    let url = "http://localhost:3000/chat?userid=" + userid + "&input=" + encodeURIComponent(input);
+    fetch(url)
+        .then(function(res) { return res.json(); })
+        .then(function(ret) {                                                                                                       
+            let div = document.getElementById('historyDiv');
+            if (ret.output) {                                                                                                           
+                let records = character.scriptFromText(ret.output);
+                for (let record of records)
+                    character.dynamicPlay(record);              
             }
-        }
-    };
-    xhr.send();
-}
-
-function sentenceSplit(s) {
-    var a = (s + " ").replace(/([\.!\?]+[ ]+)/g, "$1\n").split("\n"); // add space, then add a \n after ". ", "?!  ", for example
-    // then split on \n - this trick lets us keep that punctuation
-    // finish by trimming each piece and remove the empty ones
-    var b = [];
-    for (var i = 0; i < a.length; i++) {
-        var t = a[i].trim();
-        if (t.length > 0) b.push(t);
-    }
-    return b;
+        });    
 }
 
 document.getElementById("agentDiv").addEventListener("closedCaption", function(e) {document.getElementById('historyDiv').innerHTML += e.detail + "<br>"});
